@@ -8,7 +8,7 @@ We propose a connectivity-based graph convolution network (`cGCN`) architecture 
 The architecture of cGCN is shown below:
 
 ![Architecture of cGCN](https://github.com/Lebo-Wang/cGCN_fMRI/blob/master/fig/Figure1.JPG)
-
+ 
 ## How to run/test
 ### HCP dataset
 
