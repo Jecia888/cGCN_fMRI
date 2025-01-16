@@ -4,21 +4,8 @@ import h5py
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-# Load the CSV file
-file_path = './HCP.csv'
-data = pd.read_csv(file_path)
 
-# Filter columns ending with '_AgeAdj'
-age_adj_columns = [col for col in data.columns if col == "Subject" or col.endswith('_AgeAdj')]
-
-# Create a new DataFrame with the filtered columns
-filtered_data = data[age_adj_columns]
-
-# Save the filtered data to a new CSV file
-filtered_file_path = './HCP_filtered_AgeAdj.csv'
-filtered_data.to_csv(filtered_file_path, index=False)
-
-data_filtered = pd.read_csv('./HCP_filtered_AgeAdj.csv')
+data_filtered = pd.read_csv('./HCP.csv')
 
 label_column = 'Subject'  
 # Features and labels

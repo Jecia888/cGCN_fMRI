@@ -65,7 +65,7 @@ file_name='avg_edgeconv_k_' + str(k) + '_l2_' + str(l2_reg) + '_dp_' + str(dp)
 print('file_name:', file_name)
 
 os.system('mkdir tmp') # folder for the trained model
-tmp_name = 'tmp/tmp_' + file_name + '_' + strftime("%Y_%m_%d_%H_%M_%S", gmtime()) + '.hdf5'
+tmp_name = 'tmp/tmp_' + file_name + '_' + strftime("%Y_%m_%d_%H_%M_%S", gmtime()) + '.keras'
 print('output tmp name:', tmp_name)
 
 print("hi1")
@@ -109,7 +109,7 @@ model.summary()
 
 ######################################## Training ####################################################
 model.compile(loss=['categorical_crossentropy'], 
-              optimizer=optimizers.Adam(lr=lr),
+              optimizer=optimizers.Adam(learning_rate=lr),
               metrics=['accuracy'])
 
 print('Train...')
@@ -118,7 +118,7 @@ reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_acc', factor=0.5,
 lr_hist = []
 class Lr_record(keras.callbacks.Callback):
     def on_epoch_begin(self, epoch, logs={}):
-        tmp = K.eval(model.optimizer.lr)
+        tmp = K.eval(model.optimizer.learning_rate)
         lr_hist.append(tmp)
         print('Ir:', tmp)
 lr_record = Lr_record()

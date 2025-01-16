@@ -1,13 +1,13 @@
+from keras.layers import BatchNormalization, Dropout, Conv2D, TimeDistributed
+from keras.layers import Lambda, Flatten, Activation, Dense, Input, ConvLSTM2D
+from keras.regularizers import l2
 import keras
-from keras import layers
-from keras import layers
-from keras import regularizers
-import os
-os.environ["KERAS_BACKEND"] = "jax" 
-from keras import backend as K
+import keras.backend as K
 import tensorflow as tf
 import numpy as np
-from keras import regularizers
+
+from keras.layers import Layer, InputSpec
+from keras import initializers, regularizers, constraints
 
 def T_get_edge_feature(point_cloud_series, nn_idx, k=5):
 #     """Construct edge feature for each point
@@ -30,6 +30,7 @@ def T_get_edge_feature(point_cloud_series, nn_idx, k=5):
 
     point_cloud_shape = point_cloud_series.get_shape()
     batch_size = tf.shape(point_cloud_series)[0]
+    print(point_cloud_shape)
     time_step = point_cloud_shape[-3].value
     num_points = point_cloud_shape[-2].value
     num_dims = point_cloud_shape[-1].value
@@ -63,137 +64,127 @@ def T_get_edge_feature(point_cloud_series, nn_idx, k=5):
     return edge_feature
 
 def T_conv_bn_max(edge_feature, kernel=2, activation_fn='relu'):
-#     """TimeDistributed conv with max as aggregation
-#     Args:
-#     edge_feature: (batch_size, time_step, num_points, k, num_dims)
-#     kernel: conv kernel units
-#     activation_fn: non-linear activation
-#
-#     Returns:
-#     conv with max aggregation: (batch_size, time_step, num_points, 1, kernel)
+    """
+    TimeDistributed convolution with max aggregation.
+    
+    Args:
+        edge_feature: (batch_size, time_step, num_points, k, num_dims)
+        kernel: Number of output filters in the convolution.
+        activation_fn: Non-linear activation function (default: 'relu').
 
-    net = layers.TimeDistributed(layers.Conv2D(kernel, (1,1)))(edge_feature)
-    # net = TimeDistributed(BatchNormalization(axis=-1))(net) # BatchNorm, can be enabled
+    Returns:
+        Tensor with max aggregation: (batch_size, time_step, num_points, 1, kernel).
+    """
+    # Ensure edge_feature has the correct dimensions for Conv2D
+    edge_feature = TimeDistributed(Lambda(lambda x: tf.expand_dims(x, axis=-1)))(edge_feature)
+    # Now edge_feature shape: (batch_size, time_step, num_points, k, 1)
+
+    # Apply TimeDistributed Conv2D
+    net = TimeDistributed(Conv2D(kernel, (1, 1)))(edge_feature)
+
+    # Apply optional BatchNormalization (commented out here)
+    # net = TimeDistributed(BatchNormalization(axis=-1))(net)
+
+    # Apply activation function
     if activation_fn is not None:
-        net = layers.TimeDistributed(layers.Activation(activation_fn))(net)
-    return layers.TimeDistributed(layers.Lambda(lambda x: tf.reduce_max(x, axis=-2, keep_dims=True)))(net)
+        net = TimeDistributed(Activation(activation_fn))(net)
+
+    # Max aggregation along the k dimension
+    net = TimeDistributed(Lambda(lambda x: tf.reduce_max(x, axis=-2, keepdims=True)))(net)
+    
+    return net
 
 def T_edge_conv(point_cloud_series, graph, kernel=2, activation_fn='relu', k=5):
-    """
-    A simplified T_edge_conv that:
-    1) tiles the adjacency matrix for each sample in the batch,
-    2) constructs edge_feature,
-    3) does conv + max-pool,
-    4) returns the result.
-    """
-    def tile_graph_output_shape(input_shapes):
-        """
-        Suppose graph shape = (ROI_N, ROI_N)
-        The output shape => (None, ROI_N, ROI_N).
-        """
-        graph_shape, pc_shape = input_shapes
-        ROI_N1, ROI_N2 = (236,236)  # e.g. (236, 236)
-        return (None, ROI_N1, ROI_N2)
+#     """TimeDistributed conv with max as aggregation,
+#        wrapper for T_get_edge_feature and T_edge_conv
+#     Args:
+#     point_cloud_series: (batch_size, time_step, num_points, 1, num_dims)
+#                      or (batch_size, time_step, num_points   , num_dims)
+#     graph (FC matrix): (num_points, k)
+#     kernel: conv kernel units
+#     activation_fn: non-linear activation
+#     k: no. of neighbors for cGCN
+#
+#     Returns:
+#     conv output: (batch_size, time_step, num_points, 1, kernel)
 
-    # 1) tile graph
-    graph_tiled = layers.Lambda(
-        lambda x: tf.tile(
-            tf.expand_dims(x[0], axis=0),  # => (1, ROI_N, ROI_N)
-            [tf.shape(x[1])[0], 1, 1]      # => (batch_size, ROI_N, ROI_N)
-        ),
-        output_shape=(1, 1, 236, 8)
-    )([graph, point_cloud_series])
-
-    # 2) Build edge features
-    edge_feature = layers.Lambda(
-        lambda x: T_get_edge_feature(point_cloud_series=x[0], nn_idx=x[1], k=k), 
-        output_shape=(1, 1, 236, 8)
-    )([point_cloud_series, graph_tiled])
-
-    # 3) Conv + max
-    out = T_conv_bn_max(edge_feature, kernel=kernel, activation_fn=activation_fn)
-
-    return out
+    # assert len(graph.get_shape().as_list()) == 2
+    graph = Lambda(lambda x: tf.tile(tf.expand_dims(x[0], axis=0), 
+        [tf.shape(x[1])[0], 1, 1]))([graph, point_cloud_series])
+    edge_feature = Lambda(
+        lambda x: T_get_edge_feature(point_cloud_series=x[0], nn_idx=x[1], k=k),
+        output_shape=lambda input_shapes: (input_shapes[0][0], input_shapes[0][1], input_shapes[0][2], k)
+    )([point_cloud_series, graph])
+    
+    return T_conv_bn_max(edge_feature, kernel=kernel, activation_fn=activation_fn)
 
 ######################## Model description ########################
 
-def get_model(
-    graph_path,
-    ROI_N, 
-    frames, 
-    kernels=[8,8,8,16,32,32], 
-    k=5, 
-    l2_reg=1e-4, 
-    dp=0.5,
-    num_classes=100,
-    weight_path=None, 
-    skip=[0,0]
-):
-    ############ load static FC matrix ##############
-    print('load graph:', graph_path)
-    adj_matrix = np.load(graph_path)                             # shape = (ROI_N, ROI_N)
-    graph = adj_matrix.argsort(axis=1)[:, ::-1][:, 1:k+1]        # shape = (ROI_N, k)
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras.layers import Input, TimeDistributed, Dropout, ConvLSTM2D, BatchNormalization, Activation, Flatten, Dense, Lambda
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.models import Model
+import tensorflow.keras.backend as K
 
-    ############ define model ############
-    # 1) Input for your data
-    main_input = layers.Input((frames, ROI_N, 1), name='points')
+def get_model(graph_path,
+              ROI_N, frames,
+              kernels=[8, 8, 8, 16, 32, 32],
+              k=5, l2_reg=1e-4, dp=0.5,
+              num_classes=100,
+              weight_path=None, skip=[0, 0]):
+    # Load static FC matrix
+    print('Load graph:', graph_path)
+    adj_matrix = np.load(graph_path)
+    graph = adj_matrix.argsort(axis=1)[:, ::-1][:, 1:k+1]
+    graph_tensor = tf.constant(graph, dtype=tf.int32)
+    # Define model inputs
+    main_input = Input(shape=(None, ROI_N), name='points')
 
-    # 2) Input for the adjacency matrix
-    #    (We expect shape=(ROI_N, ROI_N) if that's truly your adjacency form.)
-    static_graph_input = layers.Input(
-        shape=(ROI_N, ROI_N),
-        dtype=tf.int32,
-        name='graph'
-    )
-    
-    # 4 stacking conv layers
-    net1 = T_edge_conv(main_input,   graph=static_graph_input, kernel=kernels[0], k=k)
-    net2 = T_edge_conv(net1,         graph=static_graph_input, kernel=kernels[1], k=k)
-    net3 = T_edge_conv(net2,         graph=static_graph_input, kernel=kernels[2], k=k)
-    net4 = T_edge_conv(net3,         graph=static_graph_input, kernel=kernels[3], k=k)
-    net  = layers.Lambda(lambda x: tf.concat([x[0], x[1], x[2], x[3]], axis=-1))([net1, net2, net3, net4])
+    # First convolutional layer
+    net1 = T_edge_conv(main_input, graph=graph_tensor, kernel=kernels[0], k=k)
+    net2 = T_edge_conv(net1, graph=graph_tensor, kernel=kernels[1], k=k)
+    net3 = T_edge_conv(net2, graph=graph_tensor, kernel=kernels[2], k=k)
+    net4 = T_edge_conv(net3, graph=graph_tensor, kernel=kernels[3], k=k)
+    net = Lambda(lambda x: tf.concat([x[0], x[1], x[2], x[3]], axis=-1))([net1, net2, net3, net4])
 
-    # 1 final conv layer
-    net = T_edge_conv(net, graph=static_graph_input, kernel=kernels[4], k=k)
+    # Final convolutional layer with shortcuts
+    net = T_edge_conv(net, graph=graph_tensor, kernel=kernels[4], k=k)
 
-    # TimeDistributed
-    net = layers.TimeDistributed(layers.Dropout(dp))(net)
-    net = layers.ConvLSTM2D(kernels[5], kernel_size=(1,1), padding='same', 
-                            return_sequences=True, 
-                            recurrent_regularizer=regularizers.l2(l2_reg))(net)
-    net = layers.TimeDistributed(layers.BatchNormalization())(net)
-    net = layers.TimeDistributed(layers.Activation('relu'))(net)
-    net = layers.TimeDistributed(layers.Flatten())(net)
-    net = layers.TimeDistributed(layers.Dropout(dp))(net)
+    # Add Dropout
+    net = TimeDistributed(Dropout(dp))(net)
+
+    # Add ConvLSTM2D for temporal information
+    net = ConvLSTM2D(kernels[5], kernel_size=(1, 1), padding='same',
+                     return_sequences=True, recurrent_regularizer=l2(l2_reg))(net)
+    net = TimeDistributed(BatchNormalization())(net)
+    net = TimeDistributed(Activation('relu'))(net)
+    net = TimeDistributed(Flatten())(net)
+    net = TimeDistributed(Dropout(dp))(net)
 
     # Dense layer with softmax activation
-    net = layers.TimeDistributed(
-        layers.Dense(num_classes, activation='softmax', 
-                     kernel_regularizer=regularizers.l2(l2_reg))
-    )(net)
+    net = TimeDistributed(Dense(num_classes, activation='softmax',
+                                kernel_regularizer=l2(l2_reg)))(net)
     # Mean prediction from each time frame
-    net = layers.Lambda(lambda x: K.mean(x, axis=1))(net)
+    net = Lambda(lambda x: K.mean(x, axis=1))(net)
 
+    # Define model
     output_layer = net
-    model = keras.models.Model(inputs=[main_input, static_graph_input], outputs=output_layer)
+    model = Model(inputs=main_input, outputs=output_layer)
 
-    # Optionally load weights
+    # Load pre-trained weights if provided
     if weight_path:
         print('Load weight:', weight_path)
-        pre_model = keras.models.load_model(
-            weight_path,
-            custom_objects={
-                'tf': tf,
-                'T_conv_bn_max': T_conv_bn_max,
-                'T_edge_conv': T_edge_conv,
-                'T_get_edge_feature': T_get_edge_feature
-            }
-        )
-        # Transfer weights
-        for i in range(skip[0], len(model.layers)-skip[1]):
+        pre_model = tf.keras.models.load_model(weight_path,
+            custom_objects={'tf': tf,
+                            'T_conv_bn_max': T_conv_bn_max,
+                            'T_edge_conv': T_edge_conv,
+                            'T_get_edge_feature': T_get_edge_feature})
+        for i in range(skip[0], len(model.layers) - skip[1]):
             model.layers[i].set_weights(pre_model.layers[i].get_weights())
 
     return model
+
 
 if __name__ == "__main__":
     # Overfit on small random datasets
@@ -203,7 +194,7 @@ if __name__ == "__main__":
     np.save('FC_random', random_FC)
     
     N = 50
-    frames = 100
+    frames = 70
     x_train = np.random.normal(0, 1, size=(N, frames, ROI_N, 1))
     x_test = np.random.normal(0, 1, size=(N, frames, ROI_N, 1))
     print('train data shape:', x_train.shape) # train data shape: (50, 100, 236, 1)
@@ -239,5 +230,6 @@ if __name__ == "__main__":
             validation_data=(x_test, y_test),
             epochs=50,
             callbacks=[checkpointer])
+    
     # Best Train acc: ~100% (random: 50%).
     # Best Test acc: ~50% (random: 50%).
